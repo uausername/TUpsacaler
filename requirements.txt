@@ -1,0 +1,6 @@
+python-telegram-bot>=21,<22
+Pillow>=10.2.0
+super-image>=0.1.7
+torch>=2.2.0
+huggingface_hub>=0.20.2
+numpy>=1.26.0
