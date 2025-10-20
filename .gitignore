@@ -1,4 +1,4 @@
-# Переменные окружения
+# Environment variables
 .env
 
 # Python
@@ -23,21 +23,32 @@ wheels/
 .installed.cfg
 *.egg
 
-# Виртуальное окружение
+# Virtual environments
 venv/
 env/
 ENV/
+.venv
+
+# Model weights
+weights/
+*.pth
+*.onnx
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
-# Логи
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
 *.log
-bot.log
 
-# Временные файлы
+# Temporary files
+temp/
+tmp/
 *.tmp
-*.temp
