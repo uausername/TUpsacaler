@@ -1,148 +1,178 @@
-import asyncio
-import io
-import logging
+#!/usr/bin/env python3
+"""
+Telegram бот для апскейлинга изображений
+Использует модель Real-ESRGAN для улучшения качества фотографий
+"""
+
 import os
-import tempfile
-from typing import Optional
-
-from PIL import Image
+import logging
+from io import BytesIO
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import torch
-from super_image import EdsrModel, ImageLoader
-from telegram import Update, constants
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+from PIL import Image
+from RealESRGAN import RealESRGAN
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
+logger = logging.getLogger(__name__)
+
+# Инициализация модели
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+logger.info(f"Используется устройство: {device}")
+
+# Загружаем модель Real-ESRGAN
+model = RealESRGAN(device, scale=4)
+model.load_weights('weights/RealESRGAN_x4.pth', download=True)
 
 
-MODEL_ID_DEFAULT = "eugenesiow/edsr-base"
-SCALE_DEFAULT = 4
-
-MODEL_ID = os.environ.get("UPSCALE_MODEL_ID", MODEL_ID_DEFAULT)
-UPSCALE_SCALE = int(os.environ.get("UPSCALE_SCALE", str(SCALE_DEFAULT)))
-PREFERRED_DEVICE = os.environ.get("TORCH_DEVICE", "cpu")  # "cpu" or "cuda"
-
-_model: Optional[EdsrModel] = None
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Привет! Пришлите фото, я увеличу его качеством x{} через {}.".format(
-            UPSCALE_SCALE, MODEL_ID
-        )
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    welcome_message = (
+        "👋 Привет! Я бот для улучшения качества фотографий!\n\n"
+        "📸 Отправь мне любое изображение, и я увеличу его разрешение в 4 раза, "
+        "сохранив при этом детали и улучшив качество.\n\n"
+        "🤖 Я использую технологию Real-ESRGAN - продвинутый алгоритм апскейлинга.\n\n"
+        "Команды:\n"
+        "/start - Показать это сообщение\n"
+        "/help - Справка\n\n"
+        "Просто отправь мне фото! 🖼️"
     )
+    await update.message.reply_text(welcome_message)
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Отправьте фото, и я верну увеличенную версию.\n"
-        "Переменные окружения:\n"
-        "- TELEGRAM_BOT_TOKEN — токен бота\n"
-        "- UPSCALE_MODEL_ID — модель HuggingFace (по умолчанию: {})\n"
-        "- UPSCALE_SCALE — коэффициент x (по умолчанию: {})\n"
-        "- TORCH_DEVICE — cpu или cuda (по умолчанию: cpu)".format(
-            MODEL_ID_DEFAULT, SCALE_DEFAULT
-        )
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
+    help_text = (
+        "ℹ️ Как использовать бота:\n\n"
+        "1. Отправьте мне любое изображение (как фото или файл)\n"
+        "2. Подождите, пока я обработаю его (это может занять 10-60 секунд)\n"
+        "3. Получите улучшенное изображение с увеличенным разрешением!\n\n"
+        "⚠️ Ограничения:\n"
+        "- Максимальный размер файла: 20 МБ\n"
+        "- Поддерживаемые форматы: JPG, PNG, WEBP\n"
+        "- Изображение будет увеличено в 4 раза\n\n"
+        "💡 Совет: Для лучшего результата используйте изображения хорошего качества."
     )
+    await update.message.reply_text(help_text)
 
 
-def _get_model() -> EdsrModel:
-    global _model
-    if _model is None:
-        logging.info("Загрузка модели %s (x%s)", MODEL_ID, UPSCALE_SCALE)
-        model = EdsrModel.from_pretrained(MODEL_ID, scale=UPSCALE_SCALE)
-        model.eval()
-        if PREFERRED_DEVICE == "cuda" and torch.cuda.is_available():
-            model = model.to("cuda")
-            logging.info("Модель переведена на CUDA")
+async def process_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка полученного изображения"""
+    try:
+        # Отправляем сообщение о начале обработки
+        processing_msg = await update.message.reply_text(
+            "⏳ Обрабатываю изображение... Это может занять некоторое время."
+        )
+        
+        # Получаем файл изображения
+        if update.message.photo:
+            # Если отправлено как фото, берем наибольшее разрешение
+            photo_file = await update.message.photo[-1].get_file()
+        elif update.message.document:
+            # Если отправлено как документ
+            photo_file = await update.message.document.get_file()
         else:
-            model = model.to("cpu")
-        _model = model
-    return _model
+            await update.message.reply_text("❌ Пожалуйста, отправьте изображение!")
+            return
+        
+        # Скачиваем изображение
+        logger.info(f"Скачивание изображения от пользователя {update.effective_user.id}")
+        photo_bytes = await photo_file.download_as_bytearray()
+        
+        # Открываем изображение
+        input_image = Image.open(BytesIO(photo_bytes)).convert('RGB')
+        logger.info(f"Исходный размер: {input_image.size}")
+        
+        # Проверяем размер изображения
+        max_dimension = 2000
+        if max(input_image.size) > max_dimension:
+            await processing_msg.edit_text(
+                f"⚠️ Изображение слишком большое! Максимальный размер: {max_dimension}x{max_dimension} пикселей.\n"
+                "Пожалуйста, отправьте изображение меньшего размера."
+            )
+            return
+        
+        # Применяем апскейлинг
+        logger.info("Применение апскейлинга...")
+        await processing_msg.edit_text("🔄 Применяю апскейлинг... Почти готово!")
+        
+        upscaled_image = model.predict(input_image)
+        logger.info(f"Новый размер: {upscaled_image.size}")
+        
+        # Сохраняем результат в буфер
+        output_buffer = BytesIO()
+        upscaled_image.save(output_buffer, format='PNG', quality=95)
+        output_buffer.seek(0)
+        
+        # Отправляем результат
+        await processing_msg.edit_text("✅ Готово! Отправляю результат...")
+        
+        caption = (
+            f"✨ Изображение улучшено!\n"
+            f"📊 Исходный размер: {input_image.size[0]}x{input_image.size[1]}\n"
+            f"📈 Новый размер: {upscaled_image.size[0]}x{upscaled_image.size[1]}\n"
+            f"🔢 Увеличение: x4"
+        )
+        
+        await update.message.reply_document(
+            document=output_buffer,
+            filename=f"upscaled_{update.effective_user.id}.png",
+            caption=caption
+        )
+        
+        # Удаляем сообщение о процессе
+        await processing_msg.delete()
+        
+        logger.info(f"Успешно обработано изображение для пользователя {update.effective_user.id}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке изображения: {e}", exc_info=True)
+        error_message = (
+            "❌ Произошла ошибка при обработке изображения.\n"
+            "Пожалуйста, попробуйте:\n"
+            "- Отправить изображение меньшего размера\n"
+            "- Использовать другой формат (JPG, PNG)\n"
+            "- Попробовать позже"
+        )
+        await update.message.reply_text(error_message)
 
 
-def _upscale_image_bytes(input_bytes: bytes) -> bytes:
-    image = Image.open(io.BytesIO(input_bytes)).convert("RGB")
-
-    model = _get_model()
-    inputs = ImageLoader.load_image(image)
-
-    with torch.inference_mode():
-        preds = model(inputs)
-
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        tmp_path = tmp.name
-
-    try:
-        ImageLoader.save_image(preds, tmp_path)
-        with open(tmp_path, "rb") as f:
-            return f.read()
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.photo:
-        return
-
-    # Сообщим о загрузке
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action=constants.ChatAction.UPLOAD_PHOTO
+async def handle_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка неподдерживаемых типов сообщений"""
+    await update.message.reply_text(
+        "❌ Я могу обрабатывать только изображения.\n"
+        "Пожалуйста, отправьте фото или изображение как файл."
     )
 
-    # Берём фото с максимальным разрешением
-    largest_photo = update.message.photo[-1]
-    file = await context.bot.get_file(largest_photo.file_id)
 
-    buffer = io.BytesIO()
-    await file.download_to_memory(out=buffer)
-    input_bytes = buffer.getvalue()
-
-    loop = asyncio.get_running_loop()
-    try:
-        upscaled_bytes = await loop.run_in_executor(
-            None, _upscale_image_bytes, input_bytes
-        )
-    except Exception as exc:  # noqa: BLE001
-        logging.exception("Ошибка апскейла: %s", exc)
-        await update.message.reply_text(
-            "Не удалось увеличить изображение. Попробуйте позже или другое фото."
-        )
-        return
-
-    caption = f"x{UPSCALE_SCALE} через {MODEL_ID}"
-    await update.message.reply_photo(photo=upscaled_bytes, caption=caption)
-
-
-def _build_application(token: str) -> Application:
-    application = ApplicationBuilder().token(token).build()
-
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-
-    return application
-
-
-def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+def main():
+    """Запуск бота"""
+    # Получаем токен из переменной окружения
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    
     if not token:
-        raise RuntimeError(
-            "Не задан TELEGRAM_BOT_TOKEN. Экспортируйте переменную окружения и запустите снова."
-        )
+        logger.error("TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
+        print("❌ Ошибка: Укажите TELEGRAM_BOT_TOKEN в файле .env")
+        return
+    
+    # Создаем приложение
+    application = Application.builder().token(token).build()
+    
+    # Регистрируем обработчики
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, process_image))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_unsupported))
+    
+    # Запускаем бота
+    logger.info("🤖 Бот запущен и готов к работе!")
+    print("✅ Бот успешно запущен! Нажмите Ctrl+C для остановки.")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    app = _build_application(token)
-    app.run_polling()
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
